@@ -1,0 +1,5 @@
+#!/bin/bash
+
+source $HOME/.postgis/.env
+
+podman start "$CONTAINER_NAME"

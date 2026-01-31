@@ -1,0 +1,10 @@
+#!/bin/bash
+
+source $HOME/.postgis/.env
+podman run -d \
+    --name="$CONTAINER_NAME" \
+    -p $HOST_PORT:$CONTAINER_PORT \
+    -e POSTGRES_PASSWORD=$ROOT_PASSWORD \
+    -v $DATA_DIR:/var/lib/postgresql/data:Z \
+    --replace \
+    docker.io/postgis/postgis:16-3.4
