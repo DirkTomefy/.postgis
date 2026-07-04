@@ -9,11 +9,12 @@ podman network exists $NETWORK_NAME || podman network create $NETWORK_NAME
 mkdir -p $DATA_DIR
 
 # lancer PostGIS
+# Utiliser le tag 18-3.4 ou latest
 podman run -d \
     --name="$CONTAINER_NAME" \
-    --network $NETWORK_NAME \
-    -p $HOST_PORT:$CONTAINER_PORT \
-    -e POSTGRES_PASSWORD=$ROOT_PASSWORD \
-    -v $DATA_DIR:/var/lib/postgresql/data:Z \
+    --network="$NETWORK_NAME" \
+    -p "$HOST_PORT:$CONTAINER_PORT" \
+    -e POSTGRES_PASSWORD="$ROOT_PASSWORD" \
+    -v "$DATA_DIR:/var/lib/postgresql:Z" \
     --replace \
-    docker.io/postgis/postgis:16-3.4
+    docker.io/postgis/postgis:18-3.6

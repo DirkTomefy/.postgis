@@ -6,22 +6,33 @@ source $HOME/.postgis/.env
 
 # Valeurs par défaut
 DB_USER=${DB_USER:-postgres}
-DB_NAME=${DB_NAME:-postgres}
+DB_NAME=${DB_NAME:-}
 CONTAINER_NAME=${CONTAINER_NAME:-tomefy-SIG}
 IN_CONTAINER=false
 DUMPFILE=""
+CLEAN=false
+JOBS=1
+VERBOSE=false
 
 # Aide
 show_help() {
     cat << EOF
-Usage: $0 [--in|--out] <dumpfile> [--dbname DBNAME] [--user USER]
+Usage: $0 [--in|--out] <dumpfile> --dbname DBNAME [--user USER] [--clean] [--jobs N] [--verbose]
 
 Options:
-  --in          Le fichier est à l'intérieur du conteneur
-  --out         Le fichier est sur l'hôte (par défaut)
-  --dbname      Nom de la base cible (défaut: postgres)
-  --user        Nom de l'utilisateur (défaut: postgres)
+  --in          Le fichier est a l'interieur du conteneur
+  --out         Le fichier est sur l'hote (par defaut)
+  --dbname      Nom de la base cible (OBLIGATOIRE)
+  --user        Nom de l'utilisateur (defaut: postgres)
+  --clean       Nettoie la base avant restauration (DROP/CREATE)
+  --jobs N      Nombre de jobs paralleles (defaut: 1)
+  --verbose     Affiche plus de details
   --help        Affiche cette aide
+
+Exemples:
+  $0 --out backup.dump --dbname ma_base
+  $0 --in /tmp/backup.dump --dbname ma_base --clean
+  $0 --out backup.sql --dbname ma_base --user mon_user
 EOF
     exit 0
 }
@@ -33,42 +44,162 @@ while [[ $# -gt 0 ]]; do
         --out)      IN_CONTAINER=false; shift ;;
         --dbname)   DB_NAME="$2"; shift 2 ;;
         --user)     DB_USER="$2"; shift 2 ;;
+        --clean)    CLEAN=true; shift ;;
+        --jobs)     JOBS="$2"; shift 2 ;;
+        --verbose)  VERBOSE=true; shift ;;
         --help)     show_help ;;
         *)          DUMPFILE="$1"; shift ;;
     esac
 done
 
+# Verification des parametres obligatoires
 if [ -z "$DUMPFILE" ]; then
-    echo "Erreur : aucun fichier de dump spécifié."
+    echo "ERREUR : aucun fichier de dump specifie."
+    echo "Utilisez --help pour l'aide."
     exit 1
 fi
 
-# Vérification de l'existence du fichier
+if [ -z "$DB_NAME" ]; then
+    echo "ERREUR : --dbname est obligatoire."
+    echo "Utilisez --help pour l'aide."
+    exit 1
+fi
+
+# Verification de l'existence du fichier
 if [ "$IN_CONTAINER" = true ]; then
     if ! podman exec "$CONTAINER_NAME" test -f "$DUMPFILE"; then
-        echo "Erreur : le fichier $DUMPFILE n'existe pas dans le conteneur."
+        echo "ERREUR : le fichier $DUMPFILE n'existe pas dans le conteneur."
         exit 1
     fi
 else
     if [ ! -f "$DUMPFILE" ]; then
-        echo "Erreur : le fichier $DUMPFILE n'existe pas sur l'hôte."
+        echo "ERREUR : le fichier $DUMPFILE n'existe pas sur l'hote."
         exit 1
     fi
 fi
 
-# Restauration selon l'extension
+# Fonction pour vérifier la version de pg_restore
+check_version() {
+    echo "Verification de la version de PostgreSQL dans le conteneur..."
+    PG_VERSION=$(podman exec "$CONTAINER_NAME" psql -U "$DB_USER" -d postgres -tAc "SELECT version();" | grep -oP '\d+\.\d+' | head -1)
+    echo "Version PostgreSQL dans le conteneur : $PG_VERSION"
+    
+    # Verifier la version de pg_restore
+    PGRESTORE_VERSION=$(podman exec "$CONTAINER_NAME" pg_restore --version | grep -oP '\d+\.\d+' | head -1)
+    echo "Version pg_restore dans le conteneur : $PGRESTORE_VERSION"
+}
+
+# Fonction pour tenter de restaurer avec différentes méthodes
+restore_with_fallback() {
+    local file=$1
+    local db=$2
+    
+    # Essayer avec pg_restore d'abord
+    echo "Tentative de restauration avec pg_restore..."
+    if podman exec "$CONTAINER_NAME" pg_restore -U "$DB_USER" -d "$db" -j "$JOBS" -v "$file" 2>&1 | tee /tmp/pg_restore_error.log; then
+        return 0
+    fi
+    
+    # Si erreur de version, essayer avec psql en utilisant le format SQL
+    if grep -q "unsupported version" /tmp/pg_restore_error.log; then
+        echo "Probleme de version detecte. Tentative de conversion en SQL..."
+        
+        # Extraire le contenu du dump en SQL
+        TEMP_SQL="/tmp/restore_$$.sql"
+        
+        if [ "$IN_CONTAINER" = true ]; then
+            podman exec "$CONTAINER_NAME" pg_restore -U "$DB_USER" -f "/tmp/restore.sql" "$file" 2>/dev/null || true
+            podman exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$db" -f "/tmp/restore.sql"
+            podman exec "$CONTAINER_NAME" rm -f "/tmp/restore.sql"
+        else
+            # Copier le fichier d'abord si nécessaire
+            TEMP_FILE="/tmp/restore_$$.dump"
+            cp "$file" "$TEMP_FILE"
+            podman cp "$TEMP_FILE" "$CONTAINER_NAME:/tmp/restore.dump"
+            podman exec "$CONTAINER_NAME" pg_restore -U "$DB_USER" -f "/tmp/restore.sql" "/tmp/restore.dump" 2>/dev/null || true
+            podman exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$db" -f "/tmp/restore.sql"
+            podman exec "$CONTAINER_NAME" rm -f "/tmp/restore.dump" "/tmp/restore.sql"
+            rm -f "$TEMP_FILE"
+        fi
+        return $?
+    fi
+    
+    return 1
+}
+
+# Si option verbose, afficher les versions
+if [ "$VERBOSE" = true ]; then
+    check_version
+fi
+
+# Verifier si la base existe et la recréer si --clean
+if [ "$CLEAN" = true ]; then
+    echo "Nettoyage de la base '$DB_NAME'..."
+    
+    DB_EXISTS=$(podman exec "$CONTAINER_NAME" psql -U "$DB_USER" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'")
+    
+    if [ "$DB_EXISTS" = "1" ]; then
+        echo "  Suppression de la base existante..."
+        podman exec "$CONTAINER_NAME" psql -U "$DB_USER" -d postgres -c "DROP DATABASE IF EXISTS \"$DB_NAME\";"
+    fi
+    
+    echo "  Creation de la base '$DB_NAME'..."
+    podman exec "$CONTAINER_NAME" psql -U "$DB_USER" -d postgres -c "CREATE DATABASE \"$DB_NAME\" OWNER \"$DB_USER\";"
+    
+    echo "  Activation de PostGIS..."
+    podman exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS postgis;"
+    podman exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS postgis_topology;"
+    podman exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;"
+    
+    echo "Base '$DB_NAME' prete pour la restauration."
+fi
+
+# Determiner le format du fichier
 if [[ "$DUMPFILE" == *.sql ]]; then
     # Fichier SQL -> utilisation de psql
+    echo "Restauration du fichier SQL..."
     if [ "$IN_CONTAINER" = true ]; then
         podman exec -i "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -f "$DUMPFILE"
     else
-        cat "$DUMPFILE" | podman exec -i "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME"
+        podman exec -i "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" < "$DUMPFILE"
     fi
 else
-    # Fichier au format personnalisé -> pg_restore
+    # Fichier binaire (.backup, .dump) -> pg_restore avec fallback
+    echo "Restauration du fichier binaire (format pg_restore)..."
+    
     if [ "$IN_CONTAINER" = true ]; then
-        podman exec -i "$CONTAINER_NAME" pg_restore -U "$DB_USER" -d "$DB_NAME" -v "$DUMPFILE"
+        # Le fichier est deja dans le conteneur
+        restore_with_fallback "$DUMPFILE" "$DB_NAME"
     else
-        cat "$DUMPFILE" | podman exec -i "$CONTAINER_NAME" pg_restore -U "$DB_USER" -d "$DB_NAME" -v -
+        # Le fichier est sur l'hote : on le copie dans le conteneur
+        TEMP_DIR="/tmp/pg_restore_$$"
+        TEMP_FILE="$TEMP_DIR/$(basename "$DUMPFILE")"
+        
+        echo "  Copie du fichier dans le conteneur..."
+        podman exec "$CONTAINER_NAME" mkdir -p "$TEMP_DIR"
+        podman cp "$DUMPFILE" "$CONTAINER_NAME:$TEMP_FILE"
+        
+        restore_with_fallback "$TEMP_FILE" "$DB_NAME"
+        
+        echo "  Nettoyage du fichier temporaire..."
+        podman exec "$CONTAINER_NAME" rm -f "$TEMP_FILE"
+        podman exec "$CONTAINER_NAME" rmdir "$TEMP_DIR" 2>/dev/null
     fi
+fi
+
+if [ $? -eq 0 ]; then
+    echo ""
+    echo "Restauration terminee avec succes !"
+    
+    echo ""
+    echo "Informations sur la base '$DB_NAME' :"
+    echo "  Nombre de tables : $(podman exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';")"
+    echo "  Nombre de vues : $(podman exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT COUNT(*) FROM information_schema.views WHERE table_schema='public';")"
+    
+    echo ""
+    echo "Version PostGIS :"
+    podman exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -c "SELECT PostGIS_Version();"
+else
+    echo "ERREUR lors de la restauration."
+    exit 1
 fi
