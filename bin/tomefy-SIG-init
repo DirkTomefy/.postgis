@@ -1,8 +1,17 @@
 #!/bin/bash
 
 source $HOME/.postgis/.env
+
+# créer le network s'il n'existe pas
+podman network exists $NETWORK_NAME || podman network create $NETWORK_NAME
+
+# créer le dossier de données si besoin
+mkdir -p $DATA_DIR
+
+# lancer PostGIS
 podman run -d \
     --name="$CONTAINER_NAME" \
+    --network $NETWORK_NAME \
     -p $HOST_PORT:$CONTAINER_PORT \
     -e POSTGRES_PASSWORD=$ROOT_PASSWORD \
     -v $DATA_DIR:/var/lib/postgresql/data:Z \
