@@ -1,0 +1,73 @@
+#!/bin/bash
+# tomefy-SIG-pg_dump
+# Effectue un dump de la base de données PostGIS.
+
+source $HOME/.postgis/.env
+
+# Valeurs par défaut
+DB_USER=${DB_USER:-postgres}
+DB_NAME=${DB_NAME:-postgres}
+CONTAINER_NAME=${CONTAINER_NAME:-tomefy-SIG}
+IN_CONTAINER=false
+DUMPFILE=""
+FORMAT="c"
+
+# Aide
+show_help() {
+    cat << EOF
+Usage: $0 [--in|--out] <dumpfile> [--dbname DBNAME] [--user USER] [--format c|p]
+
+Options:
+  --in          Le dump est créé à l'intérieur du conteneur
+  --out         Le dump est créé sur l'hôte (par défaut)
+  --dbname      Nom de la base à dumper (défaut: postgres)
+  --user        Nom de l'utilisateur (défaut: postgres)
+  --format      Format du dump : c (personnalisé) ou p (plain SQL)
+  --help        Affiche cette aide
+EOF
+    exit 0
+}
+
+# Analyse des arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --in)       IN_CONTAINER=true; shift ;;
+        --out)      IN_CONTAINER=false; shift ;;
+        --dbname)   DB_NAME="$2"; shift 2 ;;
+        --user)     DB_USER="$2"; shift 2 ;;
+        --format)   FORMAT="$2"; shift 2 ;;
+        --help)     show_help ;;
+        *)          DUMPFILE="$1"; shift ;;
+    esac
+done
+
+if [ -z "$DUMPFILE" ]; then
+    echo "Erreur : aucun nom de fichier de dump spécifié."
+    exit 1
+fi
+
+# Ajustement automatique du format si extension .sql
+if [[ "$DUMPFILE" == *.sql && "$FORMAT" == "c" ]]; then
+    FORMAT="p"
+fi
+
+# Construction de la commande pg_dump
+PG_DUMP_CMD="pg_dump -U $DB_USER -d $DB_NAME -F $FORMAT"
+
+if [ "$IN_CONTAINER" = true ]; then
+    # Vérification que le répertoire parent existe dans le conteneur
+    DUMP_DIR=$(dirname "$DUMPFILE")
+    if ! podman exec "$CONTAINER_NAME" test -d "$DUMP_DIR"; then
+        echo "Erreur : le répertoire $DUMP_DIR n'existe pas dans le conteneur."
+        exit 1
+    fi
+    podman exec "$CONTAINER_NAME" $PG_DUMP_CMD -f "$DUMPFILE"
+else
+    # Vérification que le répertoire parent existe sur l'hôte
+    DUMP_DIR=$(dirname "$DUMPFILE")
+    if [ ! -d "$DUMP_DIR" ]; then
+        echo "Erreur : le répertoire $DUMP_DIR n'existe pas sur l'hôte."
+        exit 1
+    fi
+    podman exec "$CONTAINER_NAME" $PG_DUMP_CMD > "$DUMPFILE"
+fi

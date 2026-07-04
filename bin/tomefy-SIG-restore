@@ -1,0 +1,74 @@
+#!/bin/bash
+# tomefy-SIG-restore
+# Restaure une base de données PostGIS à partir d'un dump.
+
+source $HOME/.postgis/.env
+
+# Valeurs par défaut
+DB_USER=${DB_USER:-postgres}
+DB_NAME=${DB_NAME:-postgres}
+CONTAINER_NAME=${CONTAINER_NAME:-tomefy-SIG}
+IN_CONTAINER=false
+DUMPFILE=""
+
+# Aide
+show_help() {
+    cat << EOF
+Usage: $0 [--in|--out] <dumpfile> [--dbname DBNAME] [--user USER]
+
+Options:
+  --in          Le fichier est à l'intérieur du conteneur
+  --out         Le fichier est sur l'hôte (par défaut)
+  --dbname      Nom de la base cible (défaut: postgres)
+  --user        Nom de l'utilisateur (défaut: postgres)
+  --help        Affiche cette aide
+EOF
+    exit 0
+}
+
+# Analyse des arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --in)       IN_CONTAINER=true; shift ;;
+        --out)      IN_CONTAINER=false; shift ;;
+        --dbname)   DB_NAME="$2"; shift 2 ;;
+        --user)     DB_USER="$2"; shift 2 ;;
+        --help)     show_help ;;
+        *)          DUMPFILE="$1"; shift ;;
+    esac
+done
+
+if [ -z "$DUMPFILE" ]; then
+    echo "Erreur : aucun fichier de dump spécifié."
+    exit 1
+fi
+
+# Vérification de l'existence du fichier
+if [ "$IN_CONTAINER" = true ]; then
+    if ! podman exec "$CONTAINER_NAME" test -f "$DUMPFILE"; then
+        echo "Erreur : le fichier $DUMPFILE n'existe pas dans le conteneur."
+        exit 1
+    fi
+else
+    if [ ! -f "$DUMPFILE" ]; then
+        echo "Erreur : le fichier $DUMPFILE n'existe pas sur l'hôte."
+        exit 1
+    fi
+fi
+
+# Restauration selon l'extension
+if [[ "$DUMPFILE" == *.sql ]]; then
+    # Fichier SQL -> utilisation de psql
+    if [ "$IN_CONTAINER" = true ]; then
+        podman exec -i "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -f "$DUMPFILE"
+    else
+        cat "$DUMPFILE" | podman exec -i "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME"
+    fi
+else
+    # Fichier au format personnalisé -> pg_restore
+    if [ "$IN_CONTAINER" = true ]; then
+        podman exec -i "$CONTAINER_NAME" pg_restore -U "$DB_USER" -d "$DB_NAME" -v "$DUMPFILE"
+    else
+        cat "$DUMPFILE" | podman exec -i "$CONTAINER_NAME" pg_restore -U "$DB_USER" -d "$DB_NAME" -v -
+    fi
+fi
